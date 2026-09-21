@@ -1,86 +1,76 @@
-import copy
+"""f1engine.py - confusion matrix, accuracy, precision/recall/F1, plotting.
+
+Everything (including the plot title accuracy) is computed from the confusion
+matrix, so the title always matches the diagonal.
+"""
+import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 
-def train_local_model_with_early_stopping(
-    model, train_dataset, val_dataset, device,
-    max_epochs=20, patience=3, lr=0.001, batch_size=32
-):
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    model.to(device)
+class F1Engine:
+    def __init__(self, class_names):
+        self.class_names = list(class_names)
+        self.n = len(self.class_names)
+        self.reset()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    def reset(self):
+        self.cm = np.zeros((self.n, self.n), dtype=np.int64)  # rows = true, cols = predicted
 
-    best_val_loss = float("inf")
-    best_state = None
-    epochs_no_improve = 0
-    history = []
+    def update(self, y_true, y_pred):
+        y_true = torch.as_tensor(y_true).view(-1).cpu().numpy()
+        y_pred = torch.as_tensor(y_pred).view(-1).cpu().numpy()
+        np.add.at(self.cm, (y_true, y_pred), 1)
 
-    for epoch in range(max_epochs):
-        model.train()
-        train_loss = 0
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
-
+    @torch.no_grad()
+    def evaluate(self, model, loader, device="cpu"):
+        self.reset()
         model.eval()
-        val_loss, correct, total = 0, 0, 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                preds = torch.argmax(outputs, dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-        val_loss /= len(val_loader)
-        val_acc = correct / total
+        for x, y in loader:
+            preds = model(x.to(device)).argmax(1)
+            self.update(y, preds)
+        return self.metrics()
 
-        history.append({"epoch": epoch+1, "train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc})
-        print(f"    Epoch {epoch+1}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+    def accuracy(self):
+        total = self.cm.sum()
+        return float(np.trace(self.cm) / total) if total else 0.0
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = copy.deepcopy(model.state_dict())
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"    Early stopping at epoch {epoch+1}")
-                break
+    def metrics(self):
+        cm = self.cm.astype(float)
+        tp = np.diag(cm)
+        precision = np.divide(tp, cm.sum(0), out=np.zeros(self.n), where=cm.sum(0) > 0)
+        recall = np.divide(tp, cm.sum(1), out=np.zeros(self.n), where=cm.sum(1) > 0)
+        denom = precision + recall
+        f1 = np.divide(2 * precision * recall, denom, out=np.zeros(self.n), where=denom > 0)
+        support = cm.sum(1)
+        return {
+            "accuracy": self.accuracy(),
+            "macro_f1": float(f1.mean()),
+            "weighted_f1": float((f1 * support).sum() / support.sum()) if support.sum() else 0.0,
+            "per_class": {
+                c: {"precision": float(precision[i]), "recall": float(recall[i]),
+                    "f1": float(f1[i]), "support": int(support[i])}
+                for i, c in enumerate(self.class_names)
+            },
+            "confusion_matrix": self.cm.tolist(),
+        }
 
-    model.load_state_dict(best_state)
-    return model, history
+    def plot_confusion_matrix(self, path, arch, split_name="Test"):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-
-def evaluate_model(model, test_dataset, device, batch_size=32):
-    loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    model.to(device)
-    model.eval()
-
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            outputs = model(images)
-            preds = torch.argmax(outputs, dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(labels.numpy())
-
-    acc = accuracy_score(all_labels, all_preds)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average="macro", zero_division=0
-    )
-    return {"accuracy": acc, "precision": precision, "recall": recall, "f1": f1}
+        fig, ax = plt.subplots(figsize=(1.2 * self.n + 3, 1.2 * self.n + 2.5))
+        ax.imshow(self.cm, cmap="Blues")
+        ax.set_xticks(range(self.n)); ax.set_xticklabels(self.class_names, rotation=45, ha="right")
+        ax.set_yticks(range(self.n)); ax.set_yticklabels(self.class_names)
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+        # Title is built from the real arch + the accuracy computed from THIS matrix.
+        ax.set_title(f"{arch} ({split_name} Accuracy: {self.accuracy() * 100:.1f}%)")
+        thresh = self.cm.max() / 2 if self.cm.max() else 1
+        for i in range(self.n):
+            for j in range(self.n):
+                ax.text(j, i, int(self.cm[i, j]), ha="center", va="center",
+                        color="white" if self.cm[i, j] > thresh else "black")
+        fig.tight_layout()
+        fig.savefig(path, dpi=200)
+        plt.close(fig)

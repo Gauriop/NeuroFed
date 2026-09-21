@@ -22,3 +22,4 @@ and aggregates everyone's trained weights into a global model.
 
 All teammates must map their folders to these 4 classes in this exact order:
 glioma, meningioma, notumor, pituitary
+It's the sunsule on the small node breathing in

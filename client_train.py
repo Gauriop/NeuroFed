@@ -1,161 +1,167 @@
-"""
-CLIENT TRAINING SCRIPT — full pipeline
-EDA -> Cleaning -> Architecture Comparison (with early stopping) -> Save best model
-"""
+"""client.py - local training + honest evaluation for one client.
 
-import torch
-import os
-import sys
+Fixes vs. the old client_train.py / notebook:
+  * split is SEEDED, stratified, and saved (as file paths) inside the checkpoint
+  * weights are SAVED (arch + classes + split included)
+  * evaluation reuses the saved test split and asserts zero overlap with train/val
+  * confusion-matrix title comes from the checkpoint's arch and the matrix itself
+
+Usage:
+  python client.py train --data ./data --arch resnet18 --epochs 10 --out client1.pt
+  python client.py eval  --data ./data --ckpt client1.pt --plot client1_cm.png
+"""
+import argparse
+import copy
 import json
+import os
 import random
-import shutil
+
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from PIL import Image
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
 
-sys.path.append('/content/NeuroFed')
-from models.base_model import get_base_model
-from models.fl_engine import train_local_model_with_early_stopping, evaluate_model
+from base_model import get_base_model, save_checkpoint, load_checkpoint
+from f1engine import F1Engine
 
-import torchvision.transforms as T
-from torchvision.datasets import ImageFolder
-from torch.utils.data import random_split
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+TRAIN_TF = transforms.Compose([
+    transforms.Resize((224, 224)), transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
+EVAL_TF = transforms.Compose([
+    transforms.Resize((224, 224)), transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
 
-# ============================================================
-# CONFIG — change these for your setup
-# ============================================================
-DATASET_PATH = "/content/data/Training"
-CLIENT_NAME = "gauri_kaggle"
-ARCHITECTURES_TO_COMPARE = ["resnet18", "vgg16", "mobilenet_v2"]
-IMG_SIZE = 128
-RESULTS_DIR = "/content/results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-classes = sorted(os.listdir(DATASET_PATH))
-print("Classes found:", classes)
 
-# ============================================================
-# STEP 1: EDA — before any cleaning, see what we actually have
-# ============================================================
-print("\n" + "="*60)
-print("STEP 1: EXPLORATORY DATA ANALYSIS")
-print("="*60)
+def make_split(root, seed=42, fractions=(0.7, 0.15, 0.15)):
+    """Stratified, seeded split. Returns {"train":[relpaths], "val":[...], "test":[...]}."""
+    ds = datasets.ImageFolder(root)
+    rng = np.random.RandomState(seed)
+    split = {"train": [], "val": [], "test": []}
+    for cls_idx in range(len(ds.classes)):
+        paths = sorted(os.path.relpath(p, root) for p, y in ds.samples if y == cls_idx)
+        rng.shuffle(paths)
+        n_train = int(len(paths) * fractions[0])
+        n_val = int(len(paths) * fractions[1])
+        split["train"] += paths[:n_train]
+        split["val"] += paths[n_train:n_train + n_val]
+        split["test"] += paths[n_train + n_val:]
+    assert_no_leakage(split)
+    return split
 
-# 1a. Class counts table
-counts = [len(os.listdir(os.path.join(DATASET_PATH, c))) for c in classes]
-eda_table = pd.DataFrame({"Class": classes, "Count": counts})
-print(eda_table)
-eda_table.to_csv(f"{RESULTS_DIR}/{CLIENT_NAME}_eda_class_counts.csv", index=False)
 
-plt.figure(figsize=(7,5))
-plt.bar(classes, counts, color="#1FB2A6")
-plt.title(f"Class Distribution — {CLIENT_NAME}")
-plt.ylabel("Image Count")
-for i, v in enumerate(counts):
-    plt.text(i, v+10, str(v), ha="center")
-plt.tight_layout()
-plt.savefig(f"{RESULTS_DIR}/{CLIENT_NAME}_fig1_class_distribution.png", dpi=150)
-plt.close()
+def assert_no_leakage(split):
+    tr, va, te = set(split["train"]), set(split["val"]), set(split["test"])
+    assert not (tr & te), f"LEAK: {len(tr & te)} images in both train and test"
+    assert not (va & te), f"LEAK: {len(va & te)} images in both val and test"
+    assert not (tr & va), f"LEAK: {len(tr & va)} images in both train and val"
 
-# 1b. Sample images grid
-fig, axes = plt.subplots(1, len(classes), figsize=(4*len(classes), 4))
-for ax, cls in zip(axes, classes):
-    cls_path = os.path.join(DATASET_PATH, cls)
-    img = Image.open(os.path.join(cls_path, random.choice(os.listdir(cls_path))))
-    ax.imshow(img, cmap="gray")
-    ax.set_title(cls)
-    ax.axis("off")
-plt.suptitle(f"Sample Images — {CLIENT_NAME}")
-plt.tight_layout()
-plt.savefig(f"{RESULTS_DIR}/{CLIENT_NAME}_fig2_sample_images.png", dpi=150)
-plt.close()
 
-# 1c. Image dimension check
-widths, heights = [], []
-for cls in classes:
-    cls_path = os.path.join(DATASET_PATH, cls)
-    for fname in random.sample(os.listdir(cls_path), min(50, len(os.listdir(cls_path)))):
-        try:
-            img = Image.open(os.path.join(cls_path, fname))
-            widths.append(img.size[0])
-            heights.append(img.size[1])
-        except Exception:
-            pass
-print(f"Width range: {min(widths)}-{max(widths)}, Height range: {min(heights)}-{max(heights)}")
+def make_loader(root, rel_paths, transform, batch_size, shuffle):
+    ds = datasets.ImageFolder(root, transform=transform)
+    lookup = {os.path.relpath(p, root): i for i, (p, _) in enumerate(ds.samples)}
+    missing = [p for p in rel_paths if p not in lookup]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} split files not found in {root}, e.g. {missing[:3]}")
+    return DataLoader(Subset(ds, [lookup[p] for p in rel_paths]),
+                      batch_size=batch_size, shuffle=shuffle, num_workers=2), ds.classes
 
-print("EDA figures saved:", f"{CLIENT_NAME}_fig1_class_distribution.png, {CLIENT_NAME}_fig2_sample_images.png")
 
-# ============================================================
-# STEP 2: CLEANING — remove corrupt/unreadable images
-# ============================================================
-print("\n" + "="*60)
-print("STEP 2: DATA CLEANING")
-print("="*60)
+class Client:
+    def __init__(self, data_root, arch="resnet18", seed=42, batch_size=32, lr=1e-3,
+                 device=None, split=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.arch, self.seed, self.data_root = arch, seed, data_root
+        set_seed(seed)
+        self.split = split or make_split(data_root, seed)
+        self.train_loader, self.classes = make_loader(data_root, self.split["train"], TRAIN_TF, batch_size, True)
+        self.val_loader, _ = make_loader(data_root, self.split["val"], EVAL_TF, batch_size, False)
+        self.test_loader, _ = make_loader(data_root, self.split["test"], EVAL_TF, batch_size, False)
+        self.model = get_base_model(arch, len(self.classes)).to(self.device)
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
-corrupt_files = []
-for cls in classes:
-    cls_path = os.path.join(DATASET_PATH, cls)
-    for fname in os.listdir(cls_path):
-        fpath = os.path.join(cls_path, fname)
-        try:
-            img = Image.open(fpath)
-            img.verify()
-        except Exception:
-            corrupt_files.append(fpath)
+    # ---- federated hooks -------------------------------------------------
+    def get_weights(self):
+        return copy.deepcopy(self.model.state_dict())
 
-print(f"Corrupt/unreadable files found: {len(corrupt_files)}")
-for f in corrupt_files:
-    print("  Removing:", f)
-    os.remove(f)
+    def set_weights(self, state_dict):
+        self.model.load_state_dict(state_dict, strict=True)
 
-print("Cleaning complete. Dataset is now safe to load.")
+    # ---- training --------------------------------------------------------
+    def train(self, epochs=10):
+        """Trains on TRAIN, picks the best epoch on VAL. TEST is never touched here."""
+        best_acc, best_state = -1.0, None
+        engine = F1Engine(self.classes)
+        for ep in range(1, epochs + 1):
+            self.model.train()
+            running = 0.0
+            for x, y in self.train_loader:
+                x, y = x.to(self.device), y.to(self.device)
+                self.optimizer.zero_grad()
+                loss = self.criterion(self.model(x), y)
+                loss.backward()
+                self.optimizer.step()
+                running += loss.item() * x.size(0)
+            val = engine.evaluate(self.model, self.val_loader, self.device)
+            print(f"epoch {ep}/{epochs} loss={running / len(self.split['train']):.4f} "
+                  f"val_acc={val['accuracy']:.4f} val_macro_f1={val['macro_f1']:.4f}")
+            if val["accuracy"] > best_acc:
+                best_acc, best_state = val["accuracy"], self.get_weights()
+        self.set_weights(best_state)
+        return best_acc
 
-# ============================================================
-# STEP 3: Build dataset objects (post-cleaning)
-# ============================================================
-print("\n" + "="*60)
-print("STEP 3: BUILDING DATASET")
-print("="*60)
+    def evaluate_test(self):
+        engine = F1Engine(self.classes)
+        metrics = engine.evaluate(self.model, self.test_loader, self.device)
+        return engine, metrics
 
-transform = T.Compose([
-    T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.Grayscale(num_output_channels=3),
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+    def save(self, path):
+        save_checkpoint(path, self.model, self.arch, self.classes, split=self.split, seed=self.seed)
+        print(f"saved -> {path}")
 
-full_dataset = ImageFolder(DATASET_PATH, transform=transform)
-print("Class mapping:", full_dataset.class_to_idx)
-print("Total usable images after cleaning:", len(full_dataset))
 
-n = len(full_dataset)
-train_size = int(0.7 * n)
-val_size = int(0.15 * n)
-test_size = n - train_size - val_size
-train_data, val_data, test_data = random_split(full_dataset, [train_size, val_size, test_size])
-print(f"Train: {len(train_data)} | Val: {len(val_data)} | Test: {len(test_data)}")
+def evaluate_checkpoint(data_root, ckpt_path, plot_path=None, device=None):
+    """Evaluate a saved checkpoint on the SAME test images that were held out in training."""
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, ckpt = load_checkpoint(ckpt_path, device)
+    if ckpt.get("split") is None:
+        raise ValueError("Checkpoint has no saved split -> cannot prove a clean holdout. Retrain with client.py.")
+    assert_no_leakage(ckpt["split"])
+    loader, classes = make_loader(data_root, ckpt["split"]["test"], EVAL_TF, 32, False)
+    assert classes == ckpt["classes"], "Class order differs from training"
+    engine = F1Engine(classes)
+    metrics = engine.evaluate(model, loader, device)
+    if plot_path:
+        engine.plot_confusion_matrix(plot_path, arch=ckpt["arch"])
+    return metrics
 
-# ============================================================
-# STEP 4: Train + compare architectures (with early stopping)
-# ============================================================
-print("\n" + "="*60)
-print("STEP 4: ARCHITECTURE COMPARISON")
-print("="*60)
 
-results = {}
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["train", "eval"])
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--arch", default="resnet18")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out", default="client1.pt")
+    ap.add_argument("--ckpt", default="client1.pt")
+    ap.add_argument("--plot", default="client1_confusion_matrix.png")
+    a = ap.parse_args()
 
-for arch in ARCHITECTURES_TO_COMPARE:
-    print(f"\n--- Training: {arch} ---")
-    model = get_base_model(arch=arch, num_classes=len(classes), pretrained=True)
-
-    model, history = train_local_model_with_early_stopping(
-        model, train_data, val_data, device,
-        max_epochs=20, patience=3
-    )
-
-    metrics = evaluate_model(model, test_data, device)
-    print(f"{arch} TEST metrics: {metrics}")
+    if a.mode == "train":
+        c = Client(a.data, arch=a.arch, seed=a.seed)
+        c.train(a.epochs)
+        c.save(a.out)
+        engine, m = c.evaluate_test()
+        engine.plot_confusion_matrix(a.plot, arch=a.arch)
+        print(json.dumps({k: m[k] for k in ("accuracy", "macro_f1", "weighted_f1")}, indent=2))
+    else:
+        m = evaluate_checkpoint(a.data, a.ckpt, a.plot)
+        print(json.dumps({k: m[k] for k in ("accuracy", "macro_f1", "weighted_f1")}, indent=2))
+        print("per class:", json.dumps(m["per_class"], indent=2))
