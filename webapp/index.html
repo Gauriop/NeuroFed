@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FedAvg Brain MRI — Team Dashboard</title>
+<style>
+  :root {
+    --ink: #0F1720;
+    --panel: #17212C;
+    --panel-2: #1D2833;
+    --line: #2A3540;
+    --text: #E7ECF0;
+    --muted: #8B98A5;
+    --accent: #4FD1C5;
+    --accent-dim: #2E5F5A;
+    --warn: #E2A73B;
+    --danger: #E2574C;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--ink);
+    color: var(--text);
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  }
+  body { padding: 40px 24px 80px; }
+
+  .wrap { max-width: 960px; margin: 0 auto; }
+
+  header { margin-bottom: 40px; }
+  header h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    margin: 0 0 6px;
+    letter-spacing: -0.01em;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.95rem;
+    max-width: 60ch;
+  }
+
+  .status-strip {
+    display: flex;
+    gap: 18px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+  }
+  .status-strip .dot-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--line);
+    flex-shrink: 0;
+  }
+  .dot.done { background: var(--accent); }
+  .dot.pending { background: var(--warn); }
+
+  section { margin-bottom: 44px; }
+  section > h2 {
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-weight: 500;
+    margin: 0 0 14px;
+    letter-spacing: 0.02em;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px;
+  }
+  .card .name { font-size: 0.95rem; font-weight: 600; margin-bottom: 2px; }
+  .card .dataset {
+    font-size: 0.78rem; color: var(--muted);
+    margin-bottom: 16px;
+    line-height: 1.4;
+    min-height: 2.4em;
+  }
+  .card .acc-row {
+    display: flex; align-items: baseline; gap: 6px;
+    margin-bottom: 10px;
+  }
+  .card .acc-num {
+    font-size: 1.9rem; font-weight: 600; color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .card .acc-num.pending { color: var(--warn); font-size: 1.1rem; font-weight: 500; }
+  .card .acc-label { font-size: 0.75rem; color: var(--muted); }
+  .card .sub-metrics {
+    display: flex; gap: 14px;
+    font-size: 0.75rem; color: var(--muted);
+    border-top: 1px solid var(--line);
+    padding-top: 10px;
+  }
+  .card .sub-metrics b { color: var(--text); font-weight: 500; }
+
+  .upload-panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 24px;
+  }
+  .drop-zone {
+    border: 1px dashed var(--line);
+    border-radius: var(--radius);
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--accent);
+    background: var(--panel-2);
+  }
+  .drop-zone p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .drop-zone .hint { font-size: 0.78rem; margin-top: 4px; color: var(--muted); opacity: 0.7; }
+  .drop-zone input { display: none; }
+
+  .preview-row {
+    display: flex;
+    gap: 20px;
+    margin-top: 20px;
+    align-items: flex-start;
+  }
+  .preview-row img {
+    width: 140px; height: 140px;
+    object-fit: cover;
+    border-radius: var(--radius);
+    border: 1px solid var(--line);
+    display: none;
+  }
+  .result { flex: 1; min-width: 0; }
+  .result .headline {
+    font-size: 1.3rem; font-weight: 600;
+    display: none;
+    margin-bottom: 2px;
+  }
+  .result .using {
+    font-size: 0.78rem; color: var(--muted);
+    display: none;
+    margin-bottom: 16px;
+  }
+  .bar-row { display: none; margin-bottom: 9px; }
+  .bar-row .bar-label {
+    display: flex; justify-content: space-between;
+    font-size: 0.78rem; color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .bar-track {
+    height: 6px; border-radius: 3px;
+    background: var(--line);
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%; background: var(--accent);
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+
+  .msg {
+    font-size: 0.85rem;
+    margin-top: 14px;
+    display: none;
+  }
+  .msg.error { color: var(--danger); }
+  .msg.loading { color: var(--muted); }
+
+  footer {
+    max-width: 960px; margin: 0 auto;
+    color: var(--muted); font-size: 0.75rem;
+    border-top: 1px solid var(--line);
+    padding-top: 16px; margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Federated Brain MRI Classification</h1>
+    <p>Three hospitals, one shared model. Each client trains locally on its own MRI dataset; the server averages the weights without any client sharing raw images.</p>
+    <div class="status-strip" id="statusStrip"></div>
+  </header>
+
+  <section>
+    <h2>Client &amp; global model status</h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Try a prediction</h2>
+    <div class="upload-panel">
+      <div class="drop-zone" id="dropZone">
+        <p>Drop an MRI image here, or click to choose one</p>
+        <p class="hint">JPG or PNG · axial T1/T2/FLAIR slice</p>
+        <input type="file" id="fileInput" accept="image/*" />
+      </div>
+
+      <div class="preview-row">
+        <img id="previewImg" alt="Uploaded MRI preview" />
+        <div class="result">
+          <div class="headline" id="headline"></div>
+          <div class="using" id="using"></div>
+          <div id="bars"></div>
+        </div>
+      </div>
+
+      <p class="msg loading" id="loadingMsg">Analyzing…</p>
+      <p class="msg error" id="errorMsg"></p>
+    </div>
+  </section>
+
+  <footer>
+    Predictions use whichever model <code>metrics.json</code> marks as active. Backend not running yet? Metric cards below still render from static data.
+  </footer>
+
+</div>
+
+<script>
+const API_BASE = "";
+const CLASS_ORDER = ["glioma", "meningioma", "normal", "pituitary"];
+
+async function loadMetrics() {
+  try {
+    const res = await fetch(`${API_BASE}/api/metrics`);
+    if (!res.ok) throw new Error("metrics endpoint not reachable");
+    return await res.json();
+  } catch (e) {
+    // Fallback so the dashboard still renders without a running backend
+    return {
+      clients: [
+        { id: "client1", label: "Client 1 ", dataset: "Nickparvar (Kaggle)", status: "pending" },
+        { id: "client2", label: "Client 2 ", dataset: "PMRAM Bangladeshi MRI", status: "done", accuracy: 0.9163, precision: 0.9242, recall: 0.9165, f1: 0.9174 },
+        { id: "client3", label: "Client 3", dataset: "TBD", status: "pending" },
+        { id: "global", label: "Global (FedAvg)", dataset: "Aggregated", status: "pending" }
+      ],
+      active_model_id: "client2"
+    };
+  }
+}
+
+function renderStatusStrip(clients) {
+  const strip = document.getElementById("statusStrip");
+  strip.innerHTML = clients.map(c => `
+    <div class="dot-item">
+      <span class="dot ${c.status === 'done' ? 'done' : 'pending'}"></span>
+      ${c.label}
+    </div>
+  `).join("");
+}
+
+function renderCards(clients) {
+  const wrap = document.getElementById("cards");
+  wrap.innerHTML = clients.map(c => {
+    const done = c.status === "done" && c.accuracy != null;
+    return `
+      <div class="card">
+        <div class="name">${c.label}</div>
+        <div class="dataset">${c.dataset || ""}</div>
+        <div class="acc-row">
+          <span class="acc-num ${done ? '' : 'pending'}">${done ? (c.accuracy * 100).toFixed(1) + '%' : 'Pending'}</span>
+          ${done ? '<span class="acc-label">test accuracy</span>' : ''}
+        </div>
+        ${done ? `
+          <div class="sub-metrics">
+            <span>Prec <b>${(c.precision * 100).toFixed(1)}%</b></span>
+            <span>Rec <b>${(c.recall * 100).toFixed(1)}%</b></span>
+            <span>F1 <b>${(c.f1 * 100).toFixed(1)}%</b></span>
+          </div>
+        ` : ""}
+      </div>
+    `;
+  }).join("");
+}
+
+async function init() {
+  const metrics = await loadMetrics();
+  renderStatusStrip(metrics.clients);
+  renderCards(metrics.clients);
+}
+init();
+
+// --- Upload + predict ---
+const dropZone = document.getElementById("dropZone");
+const fileInput = document.getElementById("fileInput");
+const previewImg = document.getElementById("previewImg");
+const headline = document.getElementById("headline");
+const using = document.getElementById("using");
+const bars = document.getElementById("bars");
+const loadingMsg = document.getElementById("loadingMsg");
+const errorMsg = document.getElementById("errorMsg");
+
+dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("dragover", (e) => { e.preventDefault(); dropZone.classList.add("drag-over"); });
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) handleFile(fileInput.files[0]);
+});
+
+function resetResult() {
+  headline.style.display = "none";
+  using.style.display = "none";
+  bars.innerHTML = "";
+  errorMsg.style.display = "none";
+}
+
+async function handleFile(file) {
+  resetResult();
+  previewImg.src = URL.createObjectURL(file);
+  previewImg.style.display = "block";
+  loadingMsg.style.display = "block";
+
+  const form = new FormData();
+  form.append("file", file);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/predict`, { method: "POST", body: form });
+    loadingMsg.style.display = "none";
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail || "Prediction failed.";
+      errorMsg.textContent = detail;
+      errorMsg.style.display = "block";
+      return;
+    }
+    const data = await res.json();
+    headline.textContent = data.predicted_class;
+    headline.style.display = "block";
+    using.textContent = `model: ${data.model_used} · ${(data.confidence * 100).toFixed(1)}% confidence`;
+    using.style.display = "block";
+
+    bars.innerHTML = data.all_probabilities.map(p => `
+      <div class="bar-row" style="display:block">
+        <div class="bar-label"><span>${p.class}</span><span>${(p.prob * 100).toFixed(1)}%</span></div>
+        <div class="bar-track"><div class="bar-fill" style="width:${(p.prob * 100).toFixed(1)}%"></div></div>
+      </div>
+    `).join("");
+  } catch (e) {
+    loadingMsg.style.display = "none";
+    errorMsg.textContent = "Couldn't reach the backend. Is app.py running?";
+    errorMsg.style.display = "block";
+  }
+}
+</script>
+</body>
+</html>
